@@ -5,10 +5,6 @@ module Network.FastCGI (
              FastCGIState,
              MonadFastCGI,
              getFastCGIState,
-             implementationThrowFastCGI,
-             implementationCatchFastCGI,
-             implementationBlockFastCGI,
-             implementationUnblockFastCGI,
              
              -- * Accepting requests
              acceptLoop,
@@ -113,26 +109,13 @@ module Network.FastCGI (
              fCloseOutput,
              fIsWritable,
              
-             -- * Exceptions
-             --   Because it is not possible for user code to enter the FastCGI monad
-             --   from outside it, catching exceptions in IO will not work.  Therefore
-             --   a full set of exception primitives designed to work with any
-             --   'MonadFastCGI' instance is provided.
-             FastCGIException(..),
-             fThrow,
-             fCatch,
-             fBlock,
-             fUnblock,
-             fBracket,
-             fFinally,
-             fTry,
-             fHandle,
-             fOnException
+             FastCGIException(..)
             )
     where
 
 import Control.Concurrent
 import qualified Control.Exception as Exception
+import Control.Monad.Catch (MonadCatch, catch, throwM)
 import Control.Monad.Reader
 import Data.Bits
 import qualified Data.ByteString as BS
@@ -198,7 +181,7 @@ type FastCGI = ReaderT FastCGIState IO
 
 -- | The class of monads within which the FastCGI calls are valid.  You may wish to
 --   create your own monad implementing this class.
-class (MonadIO m) => MonadFastCGI m where
+class (MonadIO m, MonadCatch m) => MonadFastCGI m where
     -- | Returns the opaque 'FastCGIState' object representing the state of the
     --   FastCGI client.
     --   Should not be called directly by user code, except implementations of
@@ -206,50 +189,10 @@ class (MonadIO m) => MonadFastCGI m where
     --   user monads can implement the interface.
     getFastCGIState
         :: m FastCGIState
-    -- | Throws an exception in the monad.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'fThrow'.
-    implementationThrowFastCGI
-        :: (Exception.Exception e)
-        => e -- ^ The exception to throw
-        -> m a
-    -- | Perform an action in the monad, with a given exception-handler action bound.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'fCatch'.
-    implementationCatchFastCGI
-        :: (Exception.Exception e)
-        => m a -- ^ The action to run with the exception handler binding in scope.
-        -> (e -> m a) -- ^ The exception handler to bind.
-        -> m a
-    -- | Block exceptions within an action.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'fBlock'.
-    implementationBlockFastCGI
-        :: m a -- ^ The action to run with exceptions blocked.
-        -> m a
-    -- | Unblock exceptions within an action.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'fUnblock'.
-    implementationUnblockFastCGI
-        :: m a -- ^ The action to run with exceptions unblocked.
-        -> m a
 
 
 instance MonadFastCGI FastCGI where
     getFastCGIState = ask
-    implementationThrowFastCGI exception = liftIO $ Exception.throwIO exception
-    implementationCatchFastCGI action handler = do
-      state <- getFastCGIState
-      liftIO $ Exception.catch (runReaderT action state)
-                               (\exception -> do
-                                  runReaderT (handler exception) state)
-    implementationBlockFastCGI action = do
-      state <- getFastCGIState
-      liftIO $ Exception.block (runReaderT action state)
-    implementationUnblockFastCGI action = do
-      state <- getFastCGIState
-      liftIO $ Exception.unblock (runReaderT action state)
-
 
 data Record = Record {
       recordType :: RecordType,
@@ -365,7 +308,7 @@ createListenSocket = do
   -- with a larger sockaddr, because that check hopefully happens after the check for
   -- the case we care about, which is that the socket is not connected and therefore
   -- has no peer name.
-  System.catch (do
+  Exception.catch (do
                  Network.getPeerName listenSocket
                  return Nothing)
                (\error -> do
@@ -386,7 +329,7 @@ createListenSocket = do
 computeWebServerAddresses :: IO (Maybe [Network.HostAddress])
 computeWebServerAddresses = do
   environment <- getEnvironment
-  System.catch (do
+  Exception.catch (do
                  string <- getEnv "FCGI_WEB_SERVER_ADDRS"
                  let split [] = []
                      split string = case elemIndex ',' string of
@@ -1213,7 +1156,7 @@ getRemoteAddress = do
   case value of
     Nothing -> return Nothing
     Just value -> do
-      fCatch (do
+      catch (do
                value' <- liftIO $ Network.inet_addr value
                return $ Just value')
              (\exception -> do
@@ -1279,7 +1222,7 @@ getServerAddress = do
   case value of
     Nothing -> return Nothing
     Just value -> do
-      fCatch (do
+      catch (do
                value' <- liftIO $ Network.inet_addr value
                return $ Just value')
              (\exception -> do
@@ -1491,7 +1434,7 @@ setResponseHeader header value = do
       responseHeaderMap <- liftIO $ takeMVar $ responseHeaderMapMVar request
       let responseHeaderMap' = Map.insert header value responseHeaderMap
       liftIO $ putMVar (responseHeaderMapMVar request) responseHeaderMap'
-    else fThrow $ NotAResponseHeader header
+    else throwM $ NotAResponseHeader header
 
 
 -- | Causes the given 'HttpHeader' response header not to be sent, overriding any value
@@ -1514,7 +1457,7 @@ unsetResponseHeader header = do
       responseHeaderMap <- liftIO $ takeMVar $ responseHeaderMapMVar request
       let responseHeaderMap' = Map.delete header responseHeaderMap
       liftIO $ putMVar (responseHeaderMapMVar request) responseHeaderMap'
-    else fThrow $ NotAResponseHeader header
+    else throwM $ NotAResponseHeader header
 
 
 -- | Returns the value of the given header which will be or has been sent with the
@@ -1533,7 +1476,7 @@ getResponseHeader header = do
       FastCGIState { request = Just request } <- getFastCGIState
       responseHeaderMap <- liftIO $ readMVar $ responseHeaderMapMVar request
       return $ Map.lookup header responseHeaderMap
-    else fThrow $ NotAResponseHeader header
+    else throwM $ NotAResponseHeader header
 
 
 -- | Causes the user agent to record the given cookie and send it back with future
@@ -1639,7 +1582,7 @@ mkUnsetCookie name  = Cookie {
 requireValidCookieName :: (MonadFastCGI m) => String -> m ()
 requireValidCookieName name = do
   if not $ isValidCookieToken name
-    then fThrow $ CookieNameInvalid name
+    then throwM $ CookieNameInvalid name
     else return ()
 
 
@@ -1814,7 +1757,7 @@ requireResponseHeadersNotYetSent = do
   FastCGIState { request = Just request } <- getFastCGIState
   alreadySent <- liftIO $ readMVar $ responseHeadersSentMVar request
   if alreadySent
-    then fThrow ResponseHeadersAlreadySent
+    then throwM ResponseHeadersAlreadySent
     else return ()
 
 
@@ -1823,116 +1766,5 @@ requireOutputNotYetClosed = do
   FastCGIState { request = Just request } <- getFastCGIState
   requestEnded <- liftIO $ readMVar $ requestEndedMVar request
   if requestEnded
-    then fThrow OutputAlreadyClosed
+    then throwM OutputAlreadyClosed
     else return ()
-
-
--- | Throw an exception in any 'MonadFastCGI' monad.
-fThrow
-    :: (Exception.Exception e, MonadFastCGI m)
-    => e -- ^ The exception to throw.
-    -> m a
-fThrow exception = implementationThrowFastCGI exception
-
-
--- | Perform an action, with a given exception-handler action bound.  See
---   'Control.Exception.catch'.  The type of exception to catch is determined by the
---   type signature of the handler.
-fCatch
-    :: (Exception.Exception e, MonadFastCGI m)
-    => m a -- ^ The action to run with the exception handler binding in scope.
-    -> (e -> m a) -- ^ The exception handler to bind.
-    -> m a
-fCatch action handler = implementationCatchFastCGI action handler
-
-
--- | Block exceptions within an action, as per the discussion in 'Control.Exception'.
-fBlock
-    :: (MonadFastCGI m)
-    => m a -- ^ The action to run with exceptions blocked.
-    -> m a
-fBlock action = implementationBlockFastCGI action
-
-
--- | Unblock exceptions within an action, as per the discussion in 'Control.Exception'.
-fUnblock
-    :: (MonadFastCGI m)
-    => m a -- ^ The action to run with exceptions unblocked.
-    -> m a
-fUnblock action = implementationUnblockFastCGI action
-
-
--- | Acquire a resource, perform computation with it, and release it; see the description
---   of 'Control.Exception.bracket'.  If an exception is raised during the computation,
---   'fBracket' will re-raise it after running the release function, having the effect
---   of propagating the exception further up the call stack.
-fBracket
-    :: (MonadFastCGI m)
-    => m a -- ^ The action to acquire the resource.
-    -> (a -> m b) -- ^ The action to release the resource.
-    -> (a -> m c) -- ^ The action to perform using the resource.
-    -> m c -- ^ The return value of the perform-action.
-fBracket acquire release perform = do
-  fBlock (do
-           resource <- acquire
-           result <- fUnblock (perform resource) `fOnException` (release resource)
-           release resource
-           return result)
-
-
--- | Perform an action, with a cleanup action bound to always occur; see the
---   description of 'Control.Exception.finally'.  If an exception is raised during the
---   computation, 'fFinally' will re-raise it after running the cleanup action, having
---   the effect of propagating the exception further up the call stack.  If no
---   exception is raised, the cleanup action will be invoked after the main action is
---   performed.
-fFinally
-    :: (MonadFastCGI m)
-    => m a -- ^ The action to perform.
-    -> m b -- ^ The cleanup action.
-    -> m a -- ^ The return value of the perform-action.
-fFinally perform cleanup = do
-  fBlock (do
-           result <- fUnblock perform `fOnException` cleanup
-           cleanup
-           return result)
-
-
--- | Perform an action.  If any exceptions of the appropriate type occur within the
---   action, return 'Left' @exception@; otherwise, return 'Right' @result@.
-fTry
-    :: (Exception.Exception e, MonadFastCGI m)
-    => m a -- ^ The action to perform.
-    -> m (Either e a)
-fTry action = do
-  fCatch (do
-           result <- action
-           return $ Right result)
-         (\exception -> return $ Left exception)
-
-
--- | As 'fCatch', but with the arguments in the other order.
-fHandle
-    :: (Exception.Exception e, MonadFastCGI m)
-    => (e -> m a) -- ^ The exception handler to bind.
-    -> m a -- ^ The action to run with the exception handler binding in scope.
-    -> m a
-fHandle handler action = fCatch action handler
-
-
--- | Perform an action, with a cleanup action bound to occur if and only if an exception
---   is raised during the action; see the description of 'Control.Exception.finally'.
---   If an exception is raised during the computation, 'fFinally' will re-raise it
---   after running the cleanup action, having the effect of propagating the exception
---   further up the call stack.  If no exception is raised, the cleanup action will not
---   be invoked.
-fOnException
-    :: (MonadFastCGI m)
-    => m a -- ^ The action to perform.
-    -> m b -- ^ The cleanup action.
-    -> m a -- ^ The return value of the perform-action.
-fOnException action cleanup = do
-  fCatch action
-         (\exception -> do
-            cleanup
-            fThrow (exception :: Exception.SomeException))
