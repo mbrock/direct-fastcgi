@@ -114,6 +114,8 @@ module Network.FastCGI (
     where
 
 import Control.Concurrent
+import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM.TChan
 import qualified Control.Exception as Exception
 import Control.Monad.Catch (MonadCatch, catch, throwM)
 import Control.Monad.Reader
@@ -141,14 +143,14 @@ data FastCGIState = FastCGIState {
       webServerAddresses :: Maybe [Network.HostAddress],
       socket :: Network.Socket,
       peer :: Network.SockAddr,
-      requestChannelMapMVar :: MVar (Map.Map Int (Chan Record)),
+      requestChannelMapMVar :: MVar (Map.Map Int (TChan Record)),
       request :: Maybe Request
     }
 
 
 data Request = Request {
       requestID :: Int,
-      requestChannel :: Chan Record,
+      requestChannel :: TChan Record,
       paramsStreamBufferMVar :: MVar BS.ByteString,
       stdinStreamBufferMVar :: MVar BS.ByteString,
       stdinStreamClosedMVar :: MVar Bool,
@@ -375,7 +377,7 @@ outsideRequestLoop fork handler = do
       case recordType record of
         BeginRequestRecord -> do
           state <- getFastCGIState
-          requestChannel <- liftIO $ newChan
+          requestChannel <- liftIO $ newTChanIO
           requestChannelMap <- liftIO $ takeMVar $ requestChannelMapMVar state
           paramsStreamBufferMVar <- liftIO $ newMVar $ BS.empty
           stdinStreamBufferMVar <- liftIO $ newMVar $ BS.empty
@@ -433,14 +435,14 @@ outsideRequestLoop fork handler = do
           case maybeRequestChannel of
             Nothing ->
                 fLog $ "Ignoring record for unknown request ID " ++ (show requestID)
-            Just requestChannel -> liftIO $ writeChan requestChannel record
+            Just requestChannel -> liftIO $ atomically $ writeTChan requestChannel record
       outsideRequestLoop fork handler
 
 
 insideRequestLoop :: (FastCGI ()) -> FastCGI ()
 insideRequestLoop handler = do
   FastCGIState { request = Just request } <- getFastCGIState
-  record <- liftIO $ readChan $ requestChannel request
+  record <- liftIO $ atomically $ readTChan $ requestChannel request
   case recordType record of
     ParamsRecord -> do
       case BS.length $ recordContent record of
@@ -1361,15 +1363,15 @@ extendStdinStreamBufferToLength desiredLength nonBlocking = do
           then liftIO $ putMVar (stdinStreamBufferMVar request) bufferSoFar
           else do
             maybeRecord <- if nonBlocking
-                             then do
-                               isEmpty <- liftIO $ isEmptyChan $ requestChannel request
+                             then liftIO $ atomically $ do
+                               isEmpty <- isEmptyTChan $ requestChannel request
                                if isEmpty
                                  then return Nothing
                                  else do
-                                   record <- liftIO $ readChan $ requestChannel request
+                                   record <- readTChan $ requestChannel request
                                    return $ Just record
                              else do
-                               record <- liftIO $ readChan $ requestChannel request
+                               record <- liftIO $ atomically $ readTChan $ requestChannel request
                                return $ Just record
             case maybeRecord of
               Nothing -> liftIO $ putMVar (stdinStreamBufferMVar request) bufferSoFar
